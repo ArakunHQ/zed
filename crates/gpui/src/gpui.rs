@@ -31,6 +31,7 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+mod layout_audit;
 mod path_builder;
 mod platform;
 pub mod prelude;

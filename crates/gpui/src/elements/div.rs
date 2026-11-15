@@ -2535,6 +2535,15 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
+                let audit = crate::layout_audit::enabled();
+                if audit {
+                    #[cfg(debug_assertions)]
+                    let at = self.source_location;
+                    #[cfg(not(debug_assertions))]
+                    let at = None;
+                    crate::layout_audit::enter(bounds, &style, window.rem_size(), at);
+                }
+
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
@@ -2626,6 +2635,9 @@ impl Interactivity {
                         });
                     });
                 });
+                if audit {
+                    crate::layout_audit::exit();
+                }
 
                 ((), element_state)
             },
