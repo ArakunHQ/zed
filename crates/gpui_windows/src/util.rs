@@ -136,6 +136,8 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
 pub(crate) fn drop_dwm_frame(hwnd: HWND) {
     let corners = DWMWCP_DONOTROUND;
     let border = DWMWA_COLOR_NONE;
+    // SAFETY: each pointer is to a local that outlives the call, and the size
+    // passed is that local's size.
     unsafe {
         DwmSetWindowAttribute(
             hwnd,

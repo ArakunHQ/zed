@@ -950,11 +950,13 @@ impl PlatformWindow for WindowsWindow {
                 })
                 .collect::<Vec<_>>()
         });
-        // The island sets its region on every frame: only a change reaches Windows.
+        // An overlay may set its region on every frame: only a change reaches Windows.
         if *self.state.input_region.borrow() == rects {
             return;
         }
         let hwnd = self.0.hwnd;
+        // SAFETY: `hwnd` is this live window. Each region made here is either
+        // deleted or handed to `SetWindowRgn`, which owns it once it succeeds.
         unsafe {
             let shape = rects.as_ref().map(|rects| {
                 let shape = CreateRectRgn(0, 0, 0, 0);
