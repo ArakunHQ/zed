@@ -130,7 +130,6 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     )
 }
 
-/// This function is used to configure the dark mode for the window built-in title bar.
 /// Keeps Windows 11 from rounding a window's corners and drawing a border
 /// around it, for windows that draw their own shape. Older Windows ignore it.
 pub(crate) fn drop_dwm_frame(hwnd: HWND) {
@@ -156,6 +155,7 @@ pub(crate) fn drop_dwm_frame(hwnd: HWND) {
     }
 }
 
+/// This function is used to configure the dark mode for the window built-in title bar.
 pub(crate) fn configure_dwm_dark_mode(hwnd: HWND, appearance: WindowAppearance) {
     let dark_mode_enabled: BOOL = match appearance {
         WindowAppearance::Dark | WindowAppearance::VibrantDark => true.into(),

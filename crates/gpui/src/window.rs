@@ -2405,7 +2405,7 @@ impl Window {
         }
     }
 
-    /// Linux (wayland) only: Set the window's input region, the area that receives pointer
+    /// Linux (wayland) and Windows only: Set the window's input region, the area that receives pointer
     /// and touch input. Events outside it pass through to whatever is below the window.
     ///
     /// - `Some(rects)` restricts input to the union of `rects`, in window coordinates.

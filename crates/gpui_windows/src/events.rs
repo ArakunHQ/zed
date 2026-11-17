@@ -31,6 +31,25 @@ pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+/// Checks where the cursor is while a window has an input region.
+pub(crate) const INPUT_REGION_TIMER_ID: usize = 2;
+/// How often that check runs: about two frames, so a click on the region never
+/// reaches the window below, however fast the pointer got there.
+///
+/// It runs at this pace the whole time the window has a region, even with the
+/// cursor far away or still. On Windows 11 that measured about 0.5% of one
+/// core, next to about 2.8% the island already spends at rest. Two ways to
+/// spend less were tried and left out, since both let a click through:
+/// - Checking less often while the cursor is far from the region. After a
+///   still cursor starts to move, the next check can come late, and a quick
+///   move and click went to the window below.
+/// - Waking on raw mouse input instead of a timer. It only comes from a
+///   physical mouse: a cursor moved by a pen, a touch screen, a remote session
+///   or `SetCursorPos` would leave the window transparent over its region.
+///
+/// Anything that lowers this cost has to keep the delay after the cursor
+/// enters the region at about this period, for every way the cursor moves.
+pub(crate) const INPUT_REGION_POLL_MS: u32 = 30;
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -326,6 +345,9 @@ impl WindowsWindowInner {
                 WindowsDispatcher::execute_runnable(runnable);
             }
             self.handle_paint_msg(handle)
+        } else if wparam.0 == INPUT_REGION_TIMER_ID {
+            self.update_click_through(handle);
+            Some(0)
         } else {
             None
         }

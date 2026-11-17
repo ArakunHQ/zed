@@ -78,9 +78,12 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
-    /// The rects that take the pointer, in device pixels, as last handed to
-    /// `SetWindowRgn`; `None` while the whole window does.
+    /// The rects that take the pointer, in the client area's device pixels;
+    /// `None` while the whole window does.
     pub input_region: RefCell<Option<Vec<RECT>>>,
+    /// Whether the window has `WS_EX_TRANSPARENT` now, so clicks pass through
+    /// it (see `update_click_through`).
+    pub click_through: Cell<bool>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -188,6 +191,7 @@ impl WindowsWindowState {
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
             input_region: RefCell::new(None),
+            click_through: Cell::new(false),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -397,6 +401,40 @@ impl WindowsWindowInner {
 
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
+    }
+
+    /// With an input region, the window lets clicks through while the cursor
+    /// is outside it, and takes them again once the cursor is back. Runs when
+    /// the region changes and on each tick of `INPUT_REGION_TIMER_ID`.
+    pub(crate) fn update_click_through(&self, hwnd: HWND) {
+        let through = match self.state.input_region.borrow().as_deref() {
+            None => false,
+            Some(rects) => {
+                let mut pt = POINT::default();
+                // SAFETY: `pt` outlives both calls, and `hwnd` is this live window.
+                let inside = unsafe {
+                    GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool()
+                } && rects
+                    .iter()
+                    .any(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom);
+                // A press that began inside keeps the pointer until it's released.
+                // SAFETY: no arguments; it reads this thread's capture.
+                !inside && unsafe { GetCapture() } != hwnd
+            }
+        };
+        if self.state.click_through.replace(through) == through {
+            return;
+        }
+        // SAFETY: `hwnd` is this live window; only its extended style changes.
+        unsafe {
+            let ex = get_window_long(hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_TRANSPARENT.0 as isize;
+            set_window_long(
+                hwnd,
+                GWL_EXSTYLE,
+                if through { ex | flag } else { ex & !flag },
+            );
+        }
     }
 }
 
@@ -935,8 +973,10 @@ impl PlatformWindow for WindowsWindow {
     }
 
     /// Clicks outside `region` go to the windows below, as a Wayland input
-    /// region does. A window region clips the pointer for every process, where
-    /// `HTTRANSPARENT` only passes it to windows of this thread.
+    /// region does. `SetWindowRgn` can't do it: it clips what the window draws
+    /// too. `HTTRANSPARENT` can't either: it passes the pointer only to windows
+    /// of this thread. So the window becomes a layered one, and a timer makes it
+    /// transparent to the pointer while the cursor is outside `region`.
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         let scale = self.state.scale_factor.get();
         let rects = region.map(|bounds| {
@@ -955,28 +995,39 @@ impl PlatformWindow for WindowsWindow {
             return;
         }
         let hwnd = self.0.hwnd;
-        // SAFETY: `hwnd` is this live window. Each region made here is either
-        // deleted or handed to `SetWindowRgn`, which owns it once it succeeds.
+        let watch = rects.is_some();
+        // Set again on every frame of an animation: restarting the timer each
+        // time would keep it from ever firing.
+        let watching = self.state.input_region.replace(rects).is_some();
+        // SAFETY: `hwnd` is this live window, and these calls only change its
+        // styles and its timer.
         unsafe {
-            let shape = rects.as_ref().map(|rects| {
-                let shape = CreateRectRgn(0, 0, 0, 0);
-                for r in rects {
-                    let one = CreateRectRgn(r.left, r.top, r.right, r.bottom);
-                    CombineRgn(Some(shape), Some(shape), Some(one), RGN_OR);
-                    DeleteObject(one.into()).ok().log_err();
+            if watch {
+                let ex = get_window_long(hwnd, GWL_EXSTYLE);
+                if ex & WS_EX_LAYERED.0 as isize == 0 {
+                    set_window_long(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+                    // A layered window shows nothing until it has an opacity.
+                    SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA).log_err();
                 }
-                shape
-            });
-            // On success Windows owns the region; on failure it is still ours.
-            if SetWindowRgn(hwnd, shape, false) == 0 {
-                log::error!("SetWindowRgn failed: {}", Error::from_thread());
-                if let Some(shape) = shape {
-                    DeleteObject(shape.into()).ok().log_err();
+                // A transparent window gets no mouse messages, so only polling
+                // the cursor tells it the pointer came back over the region.
+                // `INPUT_REGION_POLL_MS` says why the pace is fixed.
+                if !watching
+                    && SetTimer(
+                        Some(hwnd),
+                        INPUT_REGION_TIMER_ID,
+                        INPUT_REGION_POLL_MS,
+                        None,
+                    ) == 0
+                {
+                    log::error!("unable to create timer: {}", Error::from_thread());
                 }
-                return;
+            } else {
+                // Fails when no region was set before, which is fine.
+                KillTimer(Some(hwnd), INPUT_REGION_TIMER_ID).ok();
             }
         }
-        *self.state.input_region.borrow_mut() = rects;
+        self.0.update_click_through(hwnd);
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
