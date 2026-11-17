@@ -78,6 +78,9 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
+    /// The rects that take the pointer, in device pixels, as last handed to
+    /// `SetWindowRgn`; `None` while the whole window does.
+    pub input_region: RefCell<Option<Vec<RECT>>>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -99,6 +102,9 @@ pub(crate) struct WindowsWindowInner {
     system_settings: WindowsSystemSettings,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) hide_title_bar: bool,
+    /// A popup never takes the focus, not even when clicked: the window the
+    /// user types in keeps it.
+    pub(crate) no_activate: bool,
     pub(crate) is_movable: bool,
     pub(crate) is_resizable: bool,
     pub(crate) is_minimizable: bool,
@@ -181,6 +187,7 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            input_region: RefCell::new(None),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -287,6 +294,7 @@ impl WindowsWindowInner {
             state,
             handle: context.handle,
             hide_title_bar: context.hide_title_bar,
+            no_activate: context.no_activate,
             is_movable: context.is_movable,
             is_resizable: context.is_resizable,
             is_minimizable: context.is_minimizable,
@@ -411,6 +419,7 @@ struct WindowCreateContext {
     inner: Option<Result<Rc<WindowsWindowInner>>>,
     handle: AnyWindowHandle,
     hide_title_bar: bool,
+    no_activate: bool,
     display: WindowsDisplay,
     is_movable: bool,
     is_resizable: bool,
@@ -486,8 +495,13 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
+        // A popup draws its whole shape itself: `WS_POPUP` has no frame, where
+        // an overlapped window keeps a border and a shadow around it.
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            (
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                WS_POPUP,
+            )
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -524,6 +538,7 @@ impl WindowsWindow {
             inner: None,
             handle,
             hide_title_bar,
+            no_activate: params.kind == WindowKind::PopUp,
             display,
             is_movable: params.is_movable,
             is_resizable: params.is_resizable,
@@ -569,6 +584,9 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        if params.kind == WindowKind::PopUp {
+            drop_dwm_frame(hwnd);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -653,6 +671,12 @@ impl PlatformWindow for WindowsWindow {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        // Resizing a popup must not activate it or change its stacking.
+        let flags = if self.no_activate {
+            SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER
+        } else {
+            SWP_NOMOVE
+        };
 
         self.0
             .executor
@@ -665,7 +689,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        flags,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -908,6 +932,49 @@ impl PlatformWindow for WindowsWindow {
         unsafe { SetWindowTextW(self.0.hwnd, &HSTRING::from(title)) }
             .inspect_err(|e| log::error!("Set title failed: {e}"))
             .ok();
+    }
+
+    /// Clicks outside `region` go to the windows below, as a Wayland input
+    /// region does. A window region clips the pointer for every process, where
+    /// `HTTRANSPARENT` only passes it to windows of this thread.
+    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        let scale = self.state.scale_factor.get();
+        let rects = region.map(|bounds| {
+            bounds
+                .iter()
+                .map(|b| RECT {
+                    left: (b.origin.x.as_f32() * scale).floor() as i32,
+                    top: (b.origin.y.as_f32() * scale).floor() as i32,
+                    right: ((b.origin.x + b.size.width).as_f32() * scale).ceil() as i32,
+                    bottom: ((b.origin.y + b.size.height).as_f32() * scale).ceil() as i32,
+                })
+                .collect::<Vec<_>>()
+        });
+        // The island sets its region on every frame: only a change reaches Windows.
+        if *self.state.input_region.borrow() == rects {
+            return;
+        }
+        let hwnd = self.0.hwnd;
+        unsafe {
+            let shape = rects.as_ref().map(|rects| {
+                let shape = CreateRectRgn(0, 0, 0, 0);
+                for r in rects {
+                    let one = CreateRectRgn(r.left, r.top, r.right, r.bottom);
+                    CombineRgn(Some(shape), Some(shape), Some(one), RGN_OR);
+                    DeleteObject(one.into()).ok().log_err();
+                }
+                shape
+            });
+            // On success Windows owns the region; on failure it is still ours.
+            if SetWindowRgn(hwnd, shape, false) == 0 {
+                log::error!("SetWindowRgn failed: {}", Error::from_thread());
+                if let Some(shape) = shape {
+                    DeleteObject(shape.into()).ok().log_err();
+                }
+                return;
+            }
+        }
+        *self.state.input_region.borrow_mut() = rects;
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
