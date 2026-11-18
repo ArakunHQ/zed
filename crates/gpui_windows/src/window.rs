@@ -78,9 +78,15 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
-    /// The rects that take the pointer, in the client area's device pixels;
-    /// `None` while the whole window does.
+    /// The region that takes the pointer, as `set_input_region` got it; `None`
+    /// while the whole window does. `input_region` is made from it again when
+    /// the window's scale changes.
+    pub input_region_bounds: RefCell<Option<Vec<Bounds<Pixels>>>>,
+    /// `input_region_bounds` in the client area's device pixels.
     pub input_region: RefCell<Option<Vec<RECT>>>,
+    /// Whether `INPUT_REGION_TIMER_ID` runs. Not the same as having a region:
+    /// `SetTimer` can fail, and the next `set_input_region` tries again.
+    pub input_region_timer: Cell<bool>,
     /// Whether the window has `WS_EX_TRANSPARENT` now, so clicks pass through
     /// it (see `update_click_through`).
     pub click_through: Cell<bool>,
@@ -190,7 +196,9 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            input_region_bounds: RefCell::new(None),
             input_region: RefCell::new(None),
+            input_region_timer: Cell::new(false),
             click_through: Cell::new(false),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
@@ -401,6 +409,24 @@ impl WindowsWindowInner {
 
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
+    }
+
+    /// Makes the input region's rects again at the window's scale, which just
+    /// changed: they are in device pixels, and the caller only sets the region
+    /// again when its own bounds change.
+    pub(crate) fn rescale_input_region(&self, hwnd: HWND) {
+        let scale = self.state.scale_factor.get();
+        let Some(rects) = self
+            .state
+            .input_region_bounds
+            .borrow()
+            .as_deref()
+            .map(|bounds| input_rects(bounds, scale))
+        else {
+            return;
+        };
+        self.state.input_region.replace(Some(rects));
+        self.update_click_through(hwnd);
     }
 
     /// With an input region, the window lets clicks through while the cursor
@@ -979,26 +1005,19 @@ impl PlatformWindow for WindowsWindow {
     /// transparent to the pointer while the cursor is outside `region`.
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         let scale = self.state.scale_factor.get();
-        let rects = region.map(|bounds| {
-            bounds
-                .iter()
-                .map(|b| RECT {
-                    left: (b.origin.x.as_f32() * scale).floor() as i32,
-                    top: (b.origin.y.as_f32() * scale).floor() as i32,
-                    right: ((b.origin.x + b.size.width).as_f32() * scale).ceil() as i32,
-                    bottom: ((b.origin.y + b.size.height).as_f32() * scale).ceil() as i32,
-                })
-                .collect::<Vec<_>>()
-        });
-        // An overlay may set its region on every frame: only a change reaches Windows.
-        if *self.state.input_region.borrow() == rects {
+        let rects = region.map(|bounds| input_rects(bounds, scale));
+        let watch = rects.is_some();
+        // An overlay may set its region on every frame: only a change reaches
+        // Windows. A timer that did not start is the exception: it is tried again.
+        let unchanged = *self.state.input_region.borrow() == rects;
+        if unchanged && (!watch || self.state.input_region_timer.get()) {
             return;
         }
         let hwnd = self.0.hwnd;
-        let watch = rects.is_some();
-        // Set again on every frame of an animation: restarting the timer each
-        // time would keep it from ever firing.
-        let watching = self.state.input_region.replace(rects).is_some();
+        self.state
+            .input_region_bounds
+            .replace(region.map(<[_]>::to_vec));
+        self.state.input_region.replace(rects);
         // SAFETY: `hwnd` is this live window, and these calls only change its
         // styles and its timer.
         unsafe {
@@ -1011,20 +1030,26 @@ impl PlatformWindow for WindowsWindow {
                 }
                 // A transparent window gets no mouse messages, so only polling
                 // the cursor tells it the pointer came back over the region.
-                // `INPUT_REGION_POLL_MS` says why the pace is fixed.
-                if !watching
-                    && SetTimer(
+                // `INPUT_REGION_POLL_MS` says why the pace is fixed. It starts
+                // once: the region is set again on every frame of an animation,
+                // and restarting the timer each time would keep it from firing.
+                if !self.state.input_region_timer.get() {
+                    if SetTimer(
                         Some(hwnd),
                         INPUT_REGION_TIMER_ID,
                         INPUT_REGION_POLL_MS,
                         None,
                     ) == 0
-                {
-                    log::error!("unable to create timer: {}", Error::from_thread());
+                    {
+                        log::error!("unable to create timer: {}", Error::from_thread());
+                    } else {
+                        self.state.input_region_timer.set(true);
+                    }
                 }
             } else {
                 // Fails when no region was set before, which is fine.
                 KillTimer(Some(hwnd), INPUT_REGION_TIMER_ID).ok();
+                self.state.input_region_timer.set(false);
             }
         }
         self.0.update_click_through(hwnd);
@@ -1640,6 +1665,20 @@ fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     Ok(())
 }
 
+/// An input region in the client area's device pixels at `scale`. Each rect
+/// grows to whole pixels, so a fractional scale never leaves an edge out.
+fn input_rects(bounds: &[Bounds<Pixels>], scale: f32) -> Vec<RECT> {
+    bounds
+        .iter()
+        .map(|b| RECT {
+            left: (b.origin.x.as_f32() * scale).floor() as i32,
+            top: (b.origin.y.as_f32() * scale).floor() as i32,
+            right: ((b.origin.x + b.size.width).as_f32() * scale).ceil() as i32,
+            bottom: ((b.origin.y + b.size.height).as_f32() * scale).ceil() as i32,
+        })
+        .collect()
+}
+
 fn calculate_window_rect(bounds: Bounds<DevicePixels>, border_offset: &WindowBorderOffset) -> RECT {
     // NOTE:
     // The reason we're not using `AdjustWindowRectEx()` here is
@@ -1849,5 +1888,24 @@ mod tests {
             state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
             1
         );
+    }
+    #[test]
+    fn input_rects_follow_the_scale() {
+        use super::input_rects;
+        use gpui::{Bounds, px, size};
+
+        let region = [Bounds {
+            origin: point(px(256.), px(0.)),
+            size: size(px(48.), px(33.)),
+        }];
+        let at = |scale| {
+            let r = input_rects(&region, scale)[0];
+            (r.left, r.top, r.right, r.bottom)
+        };
+        assert_eq!(at(1.), (256, 0, 304, 33));
+        // The same region after the window moves to a 150% display.
+        assert_eq!(at(1.5), (384, 0, 456, 50));
+        // A fractional scale rounds outward.
+        assert_eq!(at(1.25), (320, 0, 380, 42));
     }
 }

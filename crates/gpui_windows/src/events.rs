@@ -33,8 +33,10 @@ pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 /// Checks where the cursor is while a window has an input region.
 pub(crate) const INPUT_REGION_TIMER_ID: usize = 2;
-/// How often that check runs: about two frames, so a click on the region never
-/// reaches the window below, however fast the pointer got there.
+/// How often that check runs: about two frames. It is no hard bound: a click
+/// that lands on the region before the next check still goes to the window
+/// below, so the pace has to stay shorter than a hand takes to get the pointer
+/// there and press.
 ///
 /// It runs at this pace the whole time the window has a region, even with the
 /// cursor far away or still. On Windows 11 that measured about 0.5% of one
@@ -910,6 +912,7 @@ impl WindowsWindowInner {
         let is_maximized = self.state.is_maximized();
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
+        self.rescale_input_region(handle);
         self.state.border_offset.update(handle).log_err();
 
         self.state
