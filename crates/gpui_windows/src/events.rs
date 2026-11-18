@@ -31,6 +31,27 @@ pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+/// Checks where the cursor is while a window has an input region.
+pub(crate) const INPUT_REGION_TIMER_ID: usize = 2;
+/// How often that check runs: about two frames. It is no hard bound: a click
+/// that lands on the region before the next check still goes to the window
+/// below, so the pace has to stay shorter than a hand takes to get the pointer
+/// there and press.
+///
+/// It runs at this pace the whole time the window has a region, even with the
+/// cursor far away or still. On Windows 11 that measured about 0.5% of one
+/// core, next to about 2.8% the island already spends at rest. Two ways to
+/// spend less were tried and left out, since both let a click through:
+/// - Checking less often while the cursor is far from the region. After a
+///   still cursor starts to move, the next check can come late, and a quick
+///   move and click went to the window below.
+/// - Waking on raw mouse input instead of a timer. It only comes from a
+///   physical mouse: a cursor moved by a pen, a touch screen, a remote session
+///   or `SetCursorPos` would leave the window transparent over its region.
+///
+/// Anything that lowers this cost has to keep the delay after the cursor
+/// enters the region at about this period, for every way the cursor moves.
+pub(crate) const INPUT_REGION_POLL_MS: u32 = 30;
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -92,7 +113,9 @@ impl WindowsWindowInner {
             // The GPUI event is dispatched in between, so a click handler runs while `active_window` is still
             // whichever window was active before the click. If that handler consumes the
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
-            // So, let's eagerly activate the window.
+            // So, let's eagerly activate the window. A popup stays inactive: the click
+            // still reaches it, and the focus stays where the user was typing.
+            WM_MOUSEACTIVATE if self.no_activate => Some(MA_NOACTIVATE as isize),
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
@@ -324,6 +347,9 @@ impl WindowsWindowInner {
                 WindowsDispatcher::execute_runnable(runnable);
             }
             self.handle_paint_msg(handle)
+        } else if wparam.0 == INPUT_REGION_TIMER_ID {
+            self.update_click_through(handle);
+            Some(0)
         } else {
             None
         }
@@ -886,6 +912,7 @@ impl WindowsWindowInner {
         let is_maximized = self.state.is_maximized();
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
+        self.rescale_input_region(handle);
         self.state.border_offset.update(handle).log_err();
 
         self.state

@@ -78,6 +78,18 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
+    /// The region that takes the pointer, as `set_input_region` got it; `None`
+    /// while the whole window does. `input_region` is made from it again when
+    /// the window's scale changes.
+    pub input_region_bounds: RefCell<Option<Vec<Bounds<Pixels>>>>,
+    /// `input_region_bounds` in the client area's device pixels.
+    pub input_region: RefCell<Option<Vec<RECT>>>,
+    /// Whether `INPUT_REGION_TIMER_ID` runs. Not the same as having a region:
+    /// `SetTimer` can fail, and the next `set_input_region` tries again.
+    pub input_region_timer: Cell<bool>,
+    /// Whether the window has `WS_EX_TRANSPARENT` now, so clicks pass through
+    /// it (see `update_click_through`).
+    pub click_through: Cell<bool>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -99,6 +111,9 @@ pub(crate) struct WindowsWindowInner {
     system_settings: WindowsSystemSettings,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) hide_title_bar: bool,
+    /// A popup never takes the focus, not even when clicked: the window the
+    /// user types in keeps it.
+    pub(crate) no_activate: bool,
     pub(crate) is_movable: bool,
     pub(crate) is_resizable: bool,
     pub(crate) is_minimizable: bool,
@@ -181,6 +196,10 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            input_region_bounds: RefCell::new(None),
+            input_region: RefCell::new(None),
+            input_region_timer: Cell::new(false),
+            click_through: Cell::new(false),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -287,6 +306,7 @@ impl WindowsWindowInner {
             state,
             handle: context.handle,
             hide_title_bar: context.hide_title_bar,
+            no_activate: context.no_activate,
             is_movable: context.is_movable,
             is_resizable: context.is_resizable,
             is_minimizable: context.is_minimizable,
@@ -390,6 +410,58 @@ impl WindowsWindowInner {
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
     }
+
+    /// Makes the input region's rects again at the window's scale, which just
+    /// changed: they are in device pixels, and the caller only sets the region
+    /// again when its own bounds change.
+    pub(crate) fn rescale_input_region(&self, hwnd: HWND) {
+        let scale = self.state.scale_factor.get();
+        let Some(rects) = self
+            .state
+            .input_region_bounds
+            .borrow()
+            .as_deref()
+            .map(|bounds| input_rects(bounds, scale))
+        else {
+            return;
+        };
+        self.state.input_region.replace(Some(rects));
+        self.update_click_through(hwnd);
+    }
+
+    /// With an input region, the window lets clicks through while the cursor
+    /// is outside it, and takes them again once the cursor is back. Runs when
+    /// the region changes and on each tick of `INPUT_REGION_TIMER_ID`.
+    pub(crate) fn update_click_through(&self, hwnd: HWND) {
+        let through = match self.state.input_region.borrow().as_deref() {
+            None => false,
+            Some(rects) => {
+                let mut pt = POINT::default();
+                // SAFETY: `pt` outlives both calls, and `hwnd` is this live window.
+                let inside = unsafe {
+                    GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool()
+                } && rects
+                    .iter()
+                    .any(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom);
+                // A press that began inside keeps the pointer until it's released.
+                // SAFETY: no arguments; it reads this thread's capture.
+                !inside && unsafe { GetCapture() } != hwnd
+            }
+        };
+        if self.state.click_through.replace(through) == through {
+            return;
+        }
+        // SAFETY: `hwnd` is this live window; only its extended style changes.
+        unsafe {
+            let ex = get_window_long(hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_TRANSPARENT.0 as isize;
+            set_window_long(
+                hwnd,
+                GWL_EXSTYLE,
+                if through { ex | flag } else { ex & !flag },
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -411,6 +483,7 @@ struct WindowCreateContext {
     inner: Option<Result<Rc<WindowsWindowInner>>>,
     handle: AnyWindowHandle,
     hide_title_bar: bool,
+    no_activate: bool,
     display: WindowsDisplay,
     is_movable: bool,
     is_resizable: bool,
@@ -486,8 +559,13 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
+        // A popup draws its whole shape itself: `WS_POPUP` has no frame, where
+        // an overlapped window keeps a border and a shadow around it.
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            (
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                WS_POPUP,
+            )
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -524,6 +602,7 @@ impl WindowsWindow {
             inner: None,
             handle,
             hide_title_bar,
+            no_activate: params.kind == WindowKind::PopUp,
             display,
             is_movable: params.is_movable,
             is_resizable: params.is_resizable,
@@ -569,6 +648,9 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        if params.kind == WindowKind::PopUp {
+            drop_dwm_frame(hwnd);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -653,6 +735,12 @@ impl PlatformWindow for WindowsWindow {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        // Resizing a popup must not activate it or change its stacking.
+        let flags = if self.no_activate {
+            SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER
+        } else {
+            SWP_NOMOVE
+        };
 
         self.0
             .executor
@@ -665,7 +753,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        flags,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -908,6 +996,63 @@ impl PlatformWindow for WindowsWindow {
         unsafe { SetWindowTextW(self.0.hwnd, &HSTRING::from(title)) }
             .inspect_err(|e| log::error!("Set title failed: {e}"))
             .ok();
+    }
+
+    /// Clicks outside `region` go to the windows below, as a Wayland input
+    /// region does. `SetWindowRgn` can't do it: it clips what the window draws
+    /// too. `HTTRANSPARENT` can't either: it passes the pointer only to windows
+    /// of this thread. So the window becomes a layered one, and a timer makes it
+    /// transparent to the pointer while the cursor is outside `region`.
+    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        let scale = self.state.scale_factor.get();
+        let rects = region.map(|bounds| input_rects(bounds, scale));
+        let watch = rects.is_some();
+        // An overlay may set its region on every frame: only a change reaches
+        // Windows. A timer that did not start is the exception: it is tried again.
+        let unchanged = *self.state.input_region.borrow() == rects;
+        if unchanged && (!watch || self.state.input_region_timer.get()) {
+            return;
+        }
+        let hwnd = self.0.hwnd;
+        self.state
+            .input_region_bounds
+            .replace(region.map(<[_]>::to_vec));
+        self.state.input_region.replace(rects);
+        // SAFETY: `hwnd` is this live window, and these calls only change its
+        // styles and its timer.
+        unsafe {
+            if watch {
+                let ex = get_window_long(hwnd, GWL_EXSTYLE);
+                if ex & WS_EX_LAYERED.0 as isize == 0 {
+                    set_window_long(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+                    // A layered window shows nothing until it has an opacity.
+                    SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA).log_err();
+                }
+                // A transparent window gets no mouse messages, so only polling
+                // the cursor tells it the pointer came back over the region.
+                // `INPUT_REGION_POLL_MS` says why the pace is fixed. It starts
+                // once: the region is set again on every frame of an animation,
+                // and restarting the timer each time would keep it from firing.
+                if !self.state.input_region_timer.get() {
+                    if SetTimer(
+                        Some(hwnd),
+                        INPUT_REGION_TIMER_ID,
+                        INPUT_REGION_POLL_MS,
+                        None,
+                    ) == 0
+                    {
+                        log::error!("unable to create timer: {}", Error::from_thread());
+                    } else {
+                        self.state.input_region_timer.set(true);
+                    }
+                }
+            } else {
+                // Fails when no region was set before, which is fine.
+                KillTimer(Some(hwnd), INPUT_REGION_TIMER_ID).ok();
+                self.state.input_region_timer.set(false);
+            }
+        }
+        self.0.update_click_through(hwnd);
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
@@ -1520,6 +1665,20 @@ fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     Ok(())
 }
 
+/// An input region in the client area's device pixels at `scale`. Each rect
+/// grows to whole pixels, so a fractional scale never leaves an edge out.
+fn input_rects(bounds: &[Bounds<Pixels>], scale: f32) -> Vec<RECT> {
+    bounds
+        .iter()
+        .map(|b| RECT {
+            left: (b.origin.x.as_f32() * scale).floor() as i32,
+            top: (b.origin.y.as_f32() * scale).floor() as i32,
+            right: ((b.origin.x + b.size.width).as_f32() * scale).ceil() as i32,
+            bottom: ((b.origin.y + b.size.height).as_f32() * scale).ceil() as i32,
+        })
+        .collect()
+}
+
 fn calculate_window_rect(bounds: Bounds<DevicePixels>, border_offset: &WindowBorderOffset) -> RECT {
     // NOTE:
     // The reason we're not using `AdjustWindowRectEx()` here is
@@ -1729,5 +1888,24 @@ mod tests {
             state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
             1
         );
+    }
+    #[test]
+    fn input_rects_follow_the_scale() {
+        use super::input_rects;
+        use gpui::{Bounds, px, size};
+
+        let region = [Bounds {
+            origin: point(px(256.), px(0.)),
+            size: size(px(48.), px(33.)),
+        }];
+        let at = |scale| {
+            let r = input_rects(&region, scale)[0];
+            (r.left, r.top, r.right, r.bottom)
+        };
+        assert_eq!(at(1.), (256, 0, 304, 33));
+        // The same region after the window moves to a 150% display.
+        assert_eq!(at(1.5), (384, 0, 456, 50));
+        // A fractional scale rounds outward.
+        assert_eq!(at(1.25), (320, 0, 380, 42));
     }
 }
