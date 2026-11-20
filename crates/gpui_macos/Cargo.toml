@@ -19,6 +19,7 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]
+window-capture = ["gpui/window-capture", "gpui_apple/window-capture"]
 
 [dependencies]
 gpui.workspace = true

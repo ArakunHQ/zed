@@ -4,7 +4,7 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "window-capture"))]
 use anyhow::Result;
 use block2::RcBlock;
 use cocoa::{
@@ -32,7 +32,7 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, WindowVisibility, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -2342,6 +2342,15 @@ impl PlatformWindow for MacWindow {
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
+    }
+
+    // Offscreen: the window's own drawables stay framebuffer-only, and a
+    // covered window still captures.
+    #[cfg(all(feature = "window-capture", not(any(test, feature = "test-support"))))]
+    fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
+        let mut this = self.0.lock();
+        let size = this.renderer.drawable_device_size();
+        this.renderer.render_scene_to_image(scene, size)
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {

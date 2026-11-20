@@ -27,6 +27,9 @@ test-support = [
     "proptest",
 ]
 bench-support = ["profiler", "dep:criterion"]
+# Window::render_to_image outside tests: a running app renders its own last frame
+# offscreen, so it can screenshot itself without Screen Recording permission.
+window-capture = []
 # Preserve the published feature name while consumers migrate to `bench-support`.
 bench = ["bench-support"]
 inspector = ["gpui_macros/inspector"]

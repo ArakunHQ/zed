@@ -10,7 +10,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
 
 use core_foundation::base::TCFType;
@@ -561,11 +561,19 @@ impl MetalRenderer {
         read_texture_to_image(drawable.texture())
     }
 
+    /// The size of the window's drawables in device pixels.
+    #[cfg(feature = "window-capture")]
+    pub fn drawable_device_size(&self) -> Size<DevicePixels> {
+        let s = self.layer.as_ref().map(|l| l.drawable_size());
+        let (w, h) = s.map_or((0.0, 0.0), |s| (s.width, s.height));
+        size((w.ceil() as i32).into(), (h.ceil() as i32).into())
+    }
+
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
     ///
     /// This is the primary method for headless rendering. It creates an offscreen
     /// texture, renders the scene to it, and returns the pixel data as an RGBA image.
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
     pub fn render_scene_to_image(
         &mut self,
         scene: &Scene,
@@ -1243,7 +1251,7 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;
