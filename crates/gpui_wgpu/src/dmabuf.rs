@@ -192,7 +192,16 @@ unsafe fn import(
         )
     };
     drop(hal_device);
-    Ok(unsafe { device.create_texture_from_hal::<Vulkan>(hal_texture, &desc) })
+    // The image starts in VK_IMAGE_LAYOUT_UNDEFINED, but its memory is the DMA-BUF
+    // frame, so it is already valid and must not be lazily cleared.
+    Ok(unsafe {
+        device.create_texture_from_hal::<Vulkan>(
+            hal_texture,
+            &desc,
+            wgpu::TextureUses::UNINITIALIZED,
+            true,
+        )
+    })
 }
 
 unsafe fn bind_memory(
